@@ -31,6 +31,9 @@ from datasets import load_dataset
 from huggingface_hub import Repository, create_repo
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+import sys
+import time
+import intel_extension_for_pytorch
 
 import transformers
 from transformers import (
@@ -48,7 +51,7 @@ from transformers.utils.versions import require_version
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.28.0.dev0")
+check_min_version("4.27.3")
 
 logger = get_logger(__name__)
 
@@ -188,6 +191,19 @@ def parse_args():
         action="store_true",
         help="Whether or not to enable to load a pretrained model whose head dimensions are different.",
     )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=100,
+        help="Inference steps.",
+    )
+    parser.add_argument(
+        "--dtype",
+        default="FP32",
+        type=str,
+        choices=["FP32", "BF16", "FP16"],
+        help= "Specify precision to use",
+    )
     args = parser.parse_args()
 
     # Sanity checks
@@ -205,6 +221,47 @@ def parse_args():
         assert args.output_dir is not None, "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
 
     return args
+
+MAP_TORCH_DTYPE = {"FP32": torch.float32, "FP16": torch.float16,
+                   "BF16": torch.bfloat16, "FP64": torch.float64,
+                   "CF64": torch.cfloat, "CF128": torch.cdouble,
+                   "UINT8": torch.uint8, "INT8": torch.int8,
+                   "INT16": torch.int16, "INT": torch.int32,
+                   "INT64": torch.int64, "BOOL": torch.bool,
+                  }
+
+
+
+def model_cast(model, device=None, dtype=None):
+    # Set device type
+    if (device):
+        model.to(device)
+
+    # Set data type
+    if (dtype == None):
+        pass
+    elif (dtype == "FP16"):
+        model.half()
+    elif (dtype == "BF16"):
+        model.bfloat16()
+    elif (dtype == "FP64"):
+        model.double()
+    elif (dtype == "FP32"):
+        model.float()
+    else:
+        logger.error("The datatype for model casting not yet supported by pytorch")
+
+def collate_fn_(batch, device=None, dtype=None):
+    for key, value in batch.items():
+        if device:
+            batch[key] = value.to(device)
+        if ((isinstance(value, torch.FloatTensor)\
+            or isinstance(value, torch.cuda.FloatTensor)\
+            or isinstance(value, torch.xpu.FloatTensor))\
+            and (dtype != None)\
+            and (dtype != "FP32")):
+            batch[key] = value.to(MAP_TORCH_DTYPE[dtype])
+    return batch
 
 
 def main():
@@ -275,8 +332,10 @@ def main():
         # Loading the dataset from local csv or json file.
         data_files = {}
         if args.train_file is not None:
+            print("yes")
             data_files["train"] = args.train_file
         if args.validation_file is not None:
+            print("yes")
             data_files["validation"] = args.validation_file
         extension = (args.train_file if args.train_file is not None else args.validation_file).split(".")[-1]
         raw_datasets = load_dataset(extension, data_files=data_files)
@@ -390,10 +449,6 @@ def main():
     train_dataset = processed_datasets["train"]
     eval_dataset = processed_datasets["validation_matched" if args.task_name == "mnli" else "validation"]
 
-    # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
-
     # DataLoaders creation:
     if args.pad_to_max_length:
         # If padding was already done ot max length, we use the default data collator that will just convert everything
@@ -404,65 +459,13 @@ def main():
         # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
         # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
         data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None))
-
-    train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
-    )
+        
     eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
-
-    # Optimizer
-    # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-
-    # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
-
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
-        num_training_steps=args.max_train_steps,
-    )
-
-    # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
-    )
-
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     # Figure out how many steps we should save the Accelerator states
     checkpointing_steps = args.checkpointing_steps
     if checkpointing_steps is not None and checkpointing_steps.isdigit():
         checkpointing_steps = int(checkpointing_steps)
-
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
-    if args.with_tracking:
-        experiment_config = vars(args)
-        # TensorBoard cannot log Enums, need the raw value
-        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("glue_no_trainer", experiment_config)
 
     # Get the metric function
     if args.task_name is not None:
@@ -470,165 +473,51 @@ def main():
     else:
         metric = evaluate.load("accuracy")
 
-    # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    batch_size = int(args.per_device_eval_batch_size)
 
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    completed_steps = 0
-    starting_epoch = 0
-    # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
-            accelerator.print(f"Resumed from checkpoint: {args.resume_from_checkpoint}")
-            accelerator.load_state(args.resume_from_checkpoint)
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
-            dirs.sort(key=os.path.getctime)
-            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
-        # Extract `epoch_{i}` or `step_{i}`
-        training_difference = os.path.splitext(path)[0]
+    device = torch.device("xpu")
+    model_cast(model, device=device)
+    model.eval()
+    samples_seen = 0
+    import math
+    steps_per_epoch = math.ceil(len(eval_dataset)/batch_size)
+    total_steps = args.steps
+    test_epoches = int(total_steps / steps_per_epoch)
+    warmup_steps = int(total_steps/5)
+    total_time = 0
+    logger.info("***** Running inference *****")
+    logger.info(f"  Num examples = {len(eval_dataset)}")
+    logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
+    logger.info(f"  Steps_per_epoch = {steps_per_epoch}")
+    logger.info(f"  Total steps = {total_steps}")
+    logger.info(f"  Inference epoches = {test_epoches}")
+    logger.info(f"  Warmup steps = {warmup_steps}")
+    logger.info(f"  Inference steps = {total_steps - warmup_steps}")
+    i = 1
 
-        if "epoch" in training_difference:
-            starting_epoch = int(training_difference.replace("epoch_", "")) + 1
-            resume_step = None
-        else:
-            resume_step = int(training_difference.replace("step_", ""))
-            starting_epoch = resume_step // len(train_dataloader)
-            resume_step -= starting_epoch * len(train_dataloader)
-
-    for epoch in range(starting_epoch, args.num_train_epochs):
-        model.train()
-        if args.with_tracking:
-            total_loss = 0
-        for step, batch in enumerate(train_dataloader):
-            # We need to skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == starting_epoch:
-                if resume_step is not None and step < resume_step:
-                    completed_steps += 1
-                    continue
-            outputs = model(**batch)
-            loss = outputs.loss
-            # We keep track of the loss at each epoch
-            if args.with_tracking:
-                total_loss += loss.detach().float()
-            loss = loss / args.gradient_accumulation_steps
-            accelerator.backward(loss)
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                progress_bar.update(1)
-                completed_steps += 1
-
-            if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0:
-                    output_dir = f"step_{completed_steps }"
-                    if args.output_dir is not None:
-                        output_dir = os.path.join(args.output_dir, output_dir)
-                    accelerator.save_state(output_dir)
-
-            if completed_steps >= args.max_train_steps:
-                break
-
-        model.eval()
-        samples_seen = 0
+    # optimize by xpu
+    model = torch.xpu.optimize(model=model, dtype=MAP_TORCH_DTYPE[args.dtype], level="O1", weights_prepack = False)
+    # jit
+    
+    for epoch in range(test_epoches + 1):
         for step, batch in enumerate(eval_dataloader):
+            # inputs to xpu
+            batch = collate_fn_(batch, device = "xpu")
             with torch.no_grad():
+                start = time.time()
                 outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-            predictions, references = accelerator.gather((predictions, batch["labels"]))
-            # If we are in a multiprocess environment, the last batch has duplicates
-            if accelerator.num_processes > 1:
-                if step == len(eval_dataloader) - 1:
-                    predictions = predictions[: len(eval_dataloader.dataset) - samples_seen]
-                    references = references[: len(eval_dataloader.dataset) - samples_seen]
-                else:
-                    samples_seen += references.shape[0]
-            metric.add_batch(
-                predictions=predictions,
-                references=references,
-            )
-
-        eval_metric = metric.compute()
-        logger.info(f"epoch {epoch}: {eval_metric}")
-
-        if args.with_tracking:
-            accelerator.log(
-                {
-                    "accuracy" if args.task_name is not None else "glue": eval_metric,
-                    "train_loss": total_loss.item() / len(train_dataloader),
-                    "epoch": epoch,
-                    "step": completed_steps,
-                },
-                step=completed_steps,
-            )
-
-        if args.push_to_hub and epoch < args.num_train_epochs - 1:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-            )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-                )
-
-        if args.checkpointing_steps == "epoch":
-            output_dir = f"epoch_{epoch}"
-            if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-            accelerator.save_state(output_dir)
-
-    if args.with_tracking:
-        accelerator.end_training()
-
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-        )
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
-
-    if args.task_name == "mnli":
-        # Final evaluation on mismatched validation set
-        eval_dataset = processed_datasets["validation_mismatched"]
-        eval_dataloader = DataLoader(
-            eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
-        )
-        eval_dataloader = accelerator.prepare(eval_dataloader)
-
-        model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            metric.add_batch(
-                predictions=accelerator.gather(predictions),
-                references=accelerator.gather(batch["labels"]),
-            )
-
-        eval_metric = metric.compute()
-        logger.info(f"mnli-mm: {eval_metric}")
-
-    if args.output_dir is not None:
-        all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
-        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-            json.dump(all_results, f)
+                end = time.time()
+                time_cost = end -start
+                if i > warmup_steps:
+                    total_time += time_cost
+            print("Iter {}: {} sec".format(i, time_cost))
+            if i == total_steps:
+                break
+            else:
+                i+=1
+    throughput = batch_size * (total_steps - warmup_steps) / total_time
+    print("Throughput: {}".format(throughput))
+    sys.exit()
 
 
 if __name__ == "__main__":
